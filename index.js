@@ -1,6 +1,8 @@
 const path = require("path");
+const fs = require("fs");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
+const multer = require("multer");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
@@ -10,8 +12,171 @@ const crypto = require("crypto");
 const Razorpay = require("razorpay");
 
 const app = express();
+// Production behind nginx/HTTPS: set TRUST_PROXY=1 and forward X-Forwarded-* headers
+if (String(process.env.TRUST_PROXY || "").trim() === "1") {
+  app.set("trust proxy", 1);
+}
 app.use(cors());
 app.use(express.json());
+
+// ─── Images: ./uploads — URL /uploads/<uuid>.<ext> — stable fileId for delete/update ─
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+/** Base for absolute imageUrl in JSON. If unset, derived from this request (fixes local vs wrong static IP). */
+function getPublicUploadBase(req) {
+  const fromEnv = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+  const xfProto = req.get("x-forwarded-proto");
+  const xfHost = req.get("x-forwarded-host");
+  if (xfProto && xfHost) {
+    const proto = xfProto.split(",")[0].trim();
+    const host = xfHost.split(",")[0].trim();
+    return `${proto}://${host}`;
+  }
+  const proto = (req.protocol || "http").split(",")[0].trim();
+  const host = String(req.get("host") || "").trim();
+  if (host) return `${proto}://${host}`;
+  const port = String(process.env.PORT || "4000").trim();
+  return `http://localhost:${port}`;
+}
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function isUploadFileId(id) {
+  return typeof id === "string" && UUID_RE.test(id);
+}
+function safeExtFromOriginal(name) {
+  const ext = path.extname(name || "").toLowerCase() || "";
+  return ext && ext.length <= 10 ? ext : "";
+}
+function unlinkAllForFileId(fileId) {
+  let removed = 0;
+  for (const name of fs.readdirSync(UPLOAD_DIR)) {
+    if (name.startsWith(`${fileId}.`)) {
+      fs.unlinkSync(path.join(UPLOAD_DIR, name));
+      removed += 1;
+    }
+  }
+  return removed;
+}
+function fileExistsForFileId(fileId) {
+  return fs.readdirSync(UPLOAD_DIR).some((n) => n.startsWith(`${fileId}.`));
+}
+const imageMime = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/svg+xml",
+]);
+const imageFileFilter = (_req, file, cb) => {
+  if (imageMime.has(file.mimetype)) return cb(null, true);
+  cb(new Error("Only image files are allowed"));
+};
+const uploadStorageNew = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const id = crypto.randomUUID();
+    const ext = safeExtFromOriginal(file.originalname);
+    req._uploadFileId = id;
+    cb(null, `${id}${ext}`);
+  },
+});
+const uploadImageNew = multer({
+  storage: uploadStorageNew,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: imageFileFilter,
+});
+const uploadStorageReplace = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = safeExtFromOriginal(file.originalname);
+    cb(null, `${req.params.fileId}${ext}`);
+  },
+});
+const uploadImageReplace = multer({
+  storage: uploadStorageReplace,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: imageFileFilter,
+});
+function jsonUploadError(res, err) {
+  if (err instanceof multer.MulterError) {
+    res.status(400).json({
+      success: false,
+      error: err.code === "LIMIT_FILE_SIZE" ? "File too large (max 10MB)" : err.message,
+    });
+    return true;
+  }
+  if (err) {
+    res.status(400).json({ success: false, error: err.message || "Upload error" });
+    return true;
+  }
+  return false;
+}
+app.use("/uploads", express.static(UPLOAD_DIR));
+// POST — new image; response में fileId रखो (delete/update के लिए)
+app.post("/upload", (req, res) => {
+  uploadImageNew.single("image")(req, res, (err) => {
+    if (jsonUploadError(res, err)) return;
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded. Use multipart/form-data field name "image".',
+      });
+    }
+    const fileId = req._uploadFileId || path.parse(req.file.filename).name;
+    const base = getPublicUploadBase(req);
+    return res.json({
+      success: true,
+      fileId,
+      imageUrl: `${base}/uploads/${req.file.filename}`,
+      publicPath: `/uploads/${req.file.filename}`,
+    });
+  });
+});
+// PUT — same fileId पर नई फाइल (पुरानी हट जाती है)
+app.put(
+  "/upload/:fileId",
+  (req, res, next) => {
+    if (!isUploadFileId(req.params.fileId)) {
+      return res.status(400).json({ success: false, error: "Invalid fileId (expected UUID)" });
+    }
+    unlinkAllForFileId(req.params.fileId);
+    next();
+  },
+  (req, res) => {
+    uploadImageReplace.single("image")(req, res, (err) => {
+      if (jsonUploadError(res, err)) return;
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: 'No file uploaded. Use multipart/form-data field name "image".',
+        });
+      }
+      const { fileId } = req.params;
+      const base = getPublicUploadBase(req);
+      return res.json({
+        success: true,
+        fileId,
+        imageUrl: `${base}/uploads/${req.file.filename}`,
+        publicPath: `/uploads/${req.file.filename}`,
+      });
+    });
+  },
+);
+// DELETE — fileId से फाइल हटाओ
+app.delete("/upload/:fileId", (req, res) => {
+  const { fileId } = req.params;
+  if (!isUploadFileId(fileId)) {
+    return res.status(400).json({ success: false, error: "Invalid fileId (expected UUID)" });
+  }
+  if (!fileExistsForFileId(fileId)) {
+    return res.status(404).json({ success: false, error: "File not found" });
+  }
+  unlinkAllForFileId(fileId);
+  return res.json({ success: true, fileId, message: "Deleted" });
+});
 
 // Health/ping endpoint to confirm API hits
 app.get("/api/ping", (req, res) => {
