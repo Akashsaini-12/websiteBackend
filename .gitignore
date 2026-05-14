@@ -32,3 +32,6 @@ coverage/
 .idea/
 .vscode/
 
+## User uploads (do not commit binaries)
+uploads/*
+!uploads/.gitkeep
